@@ -7,6 +7,8 @@ from dipy.tracking.stopping_criterion import ThresholdStoppingCriterion
 from dipy.tracking import utils
 from dipy.data import get_sphere
 from dipy.io.streamline import save_trk
+from dipy.io.stateful_tractogram import StatefulTractogram, Space
+import nibabel as nib
 import tifffile as tiff
 import os
  
@@ -16,7 +18,7 @@ import os
 image_path = "test.tif"
 output_trk = "microscopy_tractography.trk"
 structure_sigma = 1.0
-seed_density = 1
+seed_density = 1 # Seeds per voxel
 fa_threshold = 0.1  # Lowered threshold to get more seeds
 
 # ==========================================================
@@ -139,10 +141,16 @@ streamlines = Streamlines(streamlines_generator)
 print(f"Generated {len(streamlines)} streamlines")
 
 # ==========================================================
-# SAVE OUTPUT
+# SAVE OUTPUT 
 # ==========================================================
 if len(streamlines) > 0:
-    save_trk(output_trk, streamlines, affine, shape=data_gray.shape)
+
+    # Create a NIfTI image object as reference
+    nifti_img = nib.Nifti1Image(data_gray, affine)
+ 
+    # Create a StatefulTractogram object (required for newer DIPY versions)
+    sft = StatefulTractogram(streamlines, nifti_img, Space.VOX)
+    save_trk(sft, output_trk)
     print(f"Tractography saved as {output_trk}")
 else:
     print("No streamlines generated.")
