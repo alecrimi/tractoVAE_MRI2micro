@@ -9,264 +9,279 @@ import os
 # ==========================================================
 # PARAMETERS
 # ==========================================================
-image_path = "registered_stack.nii.gz"
-output_trk = "microscopy_tractography.trk"
-peak_path = "peak_dirs.bin"
-SEED_STRIDE = 20
-MAX_ANGLE = 30.0
-MIN_STEPS = 20
-MAX_STEPS = 2000
-BATCH_SIZE = 10000
-TARGET_SL = 50000
+image_path   = "registered_stack_fixed.nii.gz"
+output_trk   = "microscopy_tractography.trk"
+MAX_ANGLE    = 60.0   # PLI at 25µm needs wider angle — rapid direction changes
+MIN_STEPS    = 10     # shorter minimum — fine scale data
+MAX_STEPS    = 2000
+BATCH_SIZE   = 5000
+TARGET_SL    = 3000
+TARGET_PER_Z = TARGET_SL // 13
+
+# Smoothing sigma in voxels — smooth direction field before tracking
+# This is the key fix: raw PLI at 25µm is too noisy for direct tracking
+# Smooth over ~200µm = 8 voxels to get bundle-level directions
+SMOOTH_SIGMA = 2.0
 
 # ==========================================================
 # LOAD
 # ==========================================================
 print("Loading header...")
-nifti_img = nib.load(image_path)
-affine = nifti_img.affine.astype(np.float32)
-inv_affine = np.linalg.inv(affine).astype(np.float32)
-zooms = nifti_img.header.get_zooms()[:3]
-shape = tuple(nifti_img.header.get_data_shape()[:3])
+nifti_img  = nib.load(image_path)
+affine     = nifti_img.affine.astype(np.float32)
+zooms      = nifti_img.header.get_zooms()[:3]
+shape      = tuple(nifti_img.header.get_data_shape()[:3])
 data_proxy = nifti_img.dataobj
-shape_max = np.array(shape, dtype=np.int32) - 1
 
-print(f"Shape : {shape}, Zooms : {zooms} mm")
+print(f"Shape  : {shape}")
+print(f"Zooms  : {zooms} mm")
+step_size  = float(min(zooms[:2])) * 0.5
+cos_max    = np.cos(np.deg2rad(MAX_ANGLE))
+print(f"Step   : {step_size:.4f} mm")
+print(f"Angle  : {MAX_ANGLE}°")
+print(f"Smooth : {SMOOTH_SIGMA} voxels = "
+      f"{SMOOTH_SIGMA*zooms[0]*1000:.0f} µm")
 
 # ==========================================================
-# TISSUE MASK
+# PER-SLICE TRACTOGRAPHY
 # ==========================================================
-print("\nBuilding tissue mask...")
-tissue_mask = np.zeros(shape, dtype=np.uint8)
+from scipy.ndimage import gaussian_filter
+
+all_streamlines = []
+
 for z in range(shape[2]):
-    sl = np.array(data_proxy[:, :, z], dtype=np.float32)
-    tissue_mask[:, :, z] = (sl > 0.001).astype(np.uint8)
-print(f"Tissue : {tissue_mask.sum():,} ({100*tissue_mask.sum()/tissue_mask.size:.1f}%)")
+    print(f"\n{'='*50}")
+    print(f"Z={z} ({z+1}/{shape[2]})", flush=True)
 
-# ==========================================================
-# ORIENTATION FIELD
-# ==========================================================
-CHUNK_SIZE = 50
-n_chunks = (shape[0] + CHUNK_SIZE - 1) // CHUNK_SIZE
+    sl_data = np.array(data_proxy[:, :, z], dtype=np.float32)
+    tissue  = sl_data > 0.0
+    n_tis   = tissue.sum()
+    print(f"  Tissue: {n_tis:,} ({100*n_tis/tissue.size:.1f}%)")
+    if n_tis == 0:
+        continue
 
-if os.path.exists(peak_path):
-    print(f"\nFound {peak_path} — skipping")
-    peak_dirs = np.memmap(peak_path, dtype=np.float32,
-                          mode='r', shape=shape+(3,))
-else:
-    print(f"\nComputing orientation in {n_chunks} chunks...")
-    peak_dirs = np.memmap(peak_path, dtype=np.float32,
-                          mode='w+', shape=shape+(3,))
-    for x0 in range(0, shape[0], CHUNK_SIZE):
-        x1 = min(x0 + CHUNK_SIZE, shape[0])
-        print(f"  X {x0}:{x1}", flush=True)
-        phi_norm = np.array(data_proxy[x0:x1], dtype=np.float32)
-        if phi_norm.ndim == 4:
-            phi_norm = phi_norm[..., 0]
-        phi = phi_norm * np.pi
-        orient = np.stack([np.cos(phi), np.sin(phi),
-                           np.zeros_like(phi)], axis=-1).astype(np.float32)
-        orient[~tissue_mask[x0:x1].astype(bool)] = 0.0
-        peak_dirs[x0:x1] = orient
-        del phi_norm, phi, orient
-        gc.collect()
-    peak_dirs.flush()
-    del peak_dirs
-    gc.collect()
-    peak_dirs = np.memmap(peak_path, dtype=np.float32,
-                          mode='r', shape=shape+(3,))
-    print("Done.")
+    # ----------------------------------------------------------
+    # SMOOTH the angle field before computing directions
+    # Raw PLI has sub-voxel crossings — smooth to bundle scale
+    # Use circular smoothing: smooth cos(2phi) and sin(2phi)
+    # separately, then reconstruct angle
+    # ----------------------------------------------------------
+    phi_raw = sl_data * np.pi           # (X, Y) in [0, π]
 
-# ==========================================================
-# SEEDS
-# ==========================================================
-print(f"\nGenerating seeds (random stratified, target {TARGET_SL})...")
+    cos2 = np.cos(2 * phi_raw)
+    sin2 = np.sin(2 * phi_raw)
 
-total_voxels = shape[0] * shape[1] * shape[2]
-tissue_frac = 0.588
-target_seeds = TARGET_SL * 3
-stride = max(1, int((total_voxels * tissue_frac / target_seeds) ** (1/3)))
-stride = max(stride, 4)
+    # Zero background before smoothing to avoid edge bleeding
+    cos2[~tissue] = 0.0
+    sin2[~tissue] = 0.0
 
-print(f"Using stride={stride}...")
+    cos2_s = gaussian_filter(cos2, sigma=SMOOTH_SIGMA)
+    sin2_s = gaussian_filter(sin2, sigma=SMOOTH_SIGMA)
 
-xs = np.arange(0, shape[0], stride)
-ys = np.arange(0, shape[1], stride)
-zs = np.arange(0, shape[2], 1)
+    # Reconstruct smoothed angle: phi_smooth = atan2(sin2, cos2) / 2
+    phi_smooth = np.arctan2(sin2_s, cos2_s) / 2.0  # in [-π/2, π/2]
+    phi_smooth += np.pi / 2 
+    
+    # Coherence map — use as confidence/stopping mask
+    coherence = np.sqrt(cos2_s**2 + sin2_s**2)     # [0, 1]
+    coherence[~tissue] = 0.0
 
-seed_list = []
-for x in xs:
-    yy, zz = np.meshgrid(ys, zs, indexing='ij')
-    coords = np.stack([
-        np.full(yy.size, x, dtype=np.int32),
-        yy.ravel().astype(np.int32),
-        zz.ravel().astype(np.int32)], axis=1)
-    in_tissue = tissue_mask[coords[:,0],
-                            coords[:,1],
-                            coords[:,2]].astype(bool)
-    seed_list.append(coords[in_tissue])
-    del coords, yy, zz, in_tissue
+    # Direction vectors from smoothed angle
+    dirx = np.cos(phi_smooth)
+    diry = np.sin(phi_smooth)
+    
+    #diry = -np.sin(phi_smooth)
+    dirx[~tissue] = 0.0
+    diry[~tissue] = 0.0
 
-seed_vox = np.concatenate(seed_list, axis=0).astype(np.float32)
-del seed_list
-gc.collect()
+    # Coherence threshold for stopping — stop where directions
+    # are locally incoherent (crossings, edges)
+    coh_threshold = 0.1
+    valid_tissue  = tissue & (coherence > coh_threshold)
 
-rng = np.random.default_rng(42)
-if len(seed_vox) > target_seeds:
-    idx = rng.choice(len(seed_vox), size=target_seeds, replace=False)
-    seed_vox = seed_vox[idx]
-    del idx
+    print(f"  Valid after coherence filter: "
+          f"{valid_tissue.sum():,} "
+          f"({100*valid_tissue.sum()/n_tis:.1f}% of tissue)")
 
-seeds_mm = (affine[:3,:3] @ seed_vox.T).T + affine[:3, 3]
-print(f"Seeds : {len(seeds_mm):,}")
-del seed_vox
-gc.collect()
+    del cos2, sin2, cos2_s, sin2_s, phi_raw, phi_smooth, coherence
 
-# ==========================================================
-# VECTORIZED TRACKER
-# ==========================================================
-cos_max = np.cos(np.deg2rad(MAX_ANGLE))
-step_size = float(min(zooms[:2])) * 0.5
+    # ----------------------------------------------------------
+    # SEEDS
+    # ----------------------------------------------------------
+    seed_coords = np.argwhere(valid_tissue)
+    n_seeds     = min(TARGET_PER_Z * 3, len(seed_coords))
+    rng         = np.random.default_rng(42 + z)
+    chosen      = rng.choice(len(seed_coords), size=n_seeds,
+                             replace=False)
+    seed_xy     = seed_coords[chosen]
 
-def mm_to_vox_batch(pts):
-    vox = (inv_affine[:3,:3] @ pts.T).T + inv_affine[:3, 3]
-    return np.clip(np.round(vox).astype(np.int32), 0, shape_max)
+    # mm coordinates — Z fixed for this slice
+    seed_mm        = np.zeros((n_seeds, 3), dtype=np.float32)
+    seed_mm[:, 0]  = seed_xy[:, 0] * float(zooms[0])
+    seed_mm[:, 1]  = seed_xy[:, 1] * float(zooms[1])
+    seed_mm[:, 2]  = z * float(zooms[2])
 
-def lookup_batch(pts):
-    idx = mm_to_vox_batch(pts)
-    return peak_dirs[idx[:,0], idx[:,1], idx[:,2]].copy()
+    print(f"  Seeds: {n_seeds:,}", flush=True)
+    del seed_coords, chosen, seed_xy
 
-def tissue_batch(pts):
-    idx = mm_to_vox_batch(pts)
-    return tissue_mask[idx[:,0], idx[:,1], idx[:,2]].astype(bool)
+    # ----------------------------------------------------------
+    # LOOKUP FUNCTIONS for this slice
+    # ----------------------------------------------------------
+    x_max = shape[0] - 1
+    y_max = shape[1] - 1
 
-def track_one_dir(batch, sign=1.0):
-    n = len(batch)
-    active = np.ones(n, dtype=bool)
-    positions = batch.copy()
-    dirs = lookup_batch(positions)
-    norms = np.linalg.norm(dirs, axis=-1, keepdims=True)
-    valid = norms[:,0] > 1e-6
-    dirs[valid] /= norms[valid]
-    dirs[~valid] = 0.0
-    active &= valid
-    dirs *= sign
+    def lookup_2d(pts_mm):
+        xi = np.clip(np.round(pts_mm[:, 0] / zooms[0]).astype(np.int32),
+                     0, x_max)
+        yi = np.clip(np.round(pts_mm[:, 1] / zooms[1]).astype(np.int32),
+                     0, y_max)
+        dx = dirx[xi, yi]
+        dy = diry[xi, yi]
+        dz = np.zeros(len(pts_mm), dtype=np.float32)
+        return np.stack([dx, dy, dz], axis=1)
 
-    traj = np.zeros((n, MAX_STEPS, 3), dtype=np.float32)
-    traj[:, 0] = positions
+    def in_tissue_2d(pts_mm):
+        xi = np.clip(np.round(pts_mm[:, 0] / zooms[0]).astype(np.int32),
+                     0, x_max)
+        yi = np.clip(np.round(pts_mm[:, 1] / zooms[1]).astype(np.int32),
+                     0, y_max)
+        return valid_tissue[xi, yi]
 
-    for step in range(1, MAX_STEPS):
-        if not active.any():
-            traj[active==False, step:] = traj[active==False, step-1:step]
-            break
+    # ----------------------------------------------------------
+    # TRACK ONE DIRECTION
+    # ----------------------------------------------------------
+    def track_one_dir_2d(batch, sign=1.0):
+        n         = len(batch)
+        active    = np.ones(n, dtype=bool)
+        positions = batch.copy()
+        dirs      = lookup_2d(positions)
 
-        next_pos = positions.copy()
-        next_pos[active] += step_size * dirs[active]
+        norms = np.linalg.norm(dirs, axis=-1, keepdims=True)
+        valid = norms[:, 0] > 1e-6
+        dirs[valid]  /= norms[valid]
+        dirs[~valid]  = 0.0
+        active       &= valid
+        dirs         *= sign
 
-        new_dirs = lookup_batch(next_pos)
-        norms = np.linalg.norm(new_dirs, axis=-1, keepdims=True)
-        valid = norms[:,0] > 1e-6
-        new_dirs[valid] /= norms[valid]
-        new_dirs[~valid] = 0.0
+        streams = [[] for _ in range(n)]
+        for i in range(n):
+            if active[i]:
+                streams[i].append(positions[i].copy())
 
-        dot = np.einsum('ij,ij->i', new_dirs, dirs)
-        flip = (dot < 0) & active
-        new_dirs[flip] = -new_dirs[flip]
-        dot[flip] = -dot[flip]
-
-        stop = ((dot < cos_max) | ~tissue_batch(next_pos) | ~valid) & active
-        active &= ~stop
-
-        traj[~active, step] = traj[~active, step-1]
-        positions[active] = next_pos[active]
-        dirs[active] = new_dirs[active]
-        traj[active, step] = positions[active]
-
-    return traj
-
-def trim(pts):
-    diffs = np.linalg.norm(np.diff(pts, axis=0), axis=-1)
-    stopped = np.where(diffs < 1e-7)[0]
-    return stopped[0] + 1 if len(stopped) else len(pts)
-
-def collect_streamlines_targeted(seeds_all, target):
-    streamlines = []
-    n_total = len(seeds_all)
-    n_batches = (n_total + BATCH_SIZE - 1) // BATCH_SIZE
-
-    for b in range(n_batches):
-        if len(streamlines) >= target:
-            print(f"  Target {target} reached — stopping early")
-            break
-
-        b0 = b * BATCH_SIZE
-        b1 = min(b0 + BATCH_SIZE, n_total)
-        batch = seeds_all[b0:b1].astype(np.float32)
-
-        pct = 100 * b1 / n_total
-        print(f"  batch {b+1}/{n_batches} ({pct:.1f}%) "
-              f"streamlines so far: {len(streamlines):,}", flush=True)
-
-        fwd = track_one_dir(batch, 1.0)
-        bwd = track_one_dir(batch, -1.0)
-
-        for i in range(len(batch)):
-            flen = trim(fwd[i])
-            blen = trim(bwd[i])
-
-            if flen + blen < MIN_STEPS:
-                continue
-
-            sl = np.concatenate([
-                bwd[i, 1:blen][::-1],
-                fwd[i, :flen]
-            ], axis=0).astype(np.float32)
-
-            streamlines.append(sl)
-
-            if len(streamlines) >= target:
+        for step in range(MAX_STEPS):
+            if not active.any():
                 break
 
+            act_idx  = np.where(active)[0]
+            next_pos = positions[act_idx] + step_size * dirs[act_idx]
+
+            new_dirs = lookup_2d(next_pos)
+            norms    = np.linalg.norm(new_dirs, axis=-1, keepdims=True)
+            valid_a  = norms[:, 0] > 1e-6
+            new_dirs[valid_a]  /= norms[valid_a]
+            new_dirs[~valid_a]  = 0.0
+
+            dot  = np.einsum('ij,ij->i', new_dirs, dirs[act_idx])
+            flip = dot < 0
+            new_dirs[flip] = -new_dirs[flip]
+            dot[flip]      = -dot[flip]
+
+            in_t = in_tissue_2d(next_pos)
+            keep = (dot >= cos_max) & in_t & valid_a
+
+            cont_idx = act_idx[keep]
+            active[act_idx[~keep]] = False
+
+            positions[cont_idx] = next_pos[keep]
+            dirs[cont_idx]      = new_dirs[keep]
+
+            for gi in cont_idx:
+                streams[gi].append(positions[gi].copy())
+
+            del next_pos, new_dirs, norms, valid_a, dot, flip, in_t, keep
+
+        return [
+            np.array(s, dtype=np.float32)
+            if len(s) >= MIN_STEPS // 2 else None
+            for s in streams
+        ]
+
+    # ----------------------------------------------------------
+    # BATCH LOOP FOR THIS SLICE
+    # ----------------------------------------------------------
+    slice_streamlines = []
+    n_batches = (n_seeds + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for b in range(n_batches):
+        if len(slice_streamlines) >= TARGET_PER_Z:
+            break
+
+        b0    = b * BATCH_SIZE
+        b1    = min(b0 + BATCH_SIZE, n_seeds)
+        batch = seed_mm[b0:b1]
+
+        fwd = track_one_dir_2d(batch,  1.0)
+        bwd = track_one_dir_2d(batch, -1.0)
+
+        for i in range(len(batch)):
+            f  = fwd[i]
+            bk = bwd[i]
+            flen = len(f)  if f  is not None else 0
+            blen = len(bk) if bk is not None else 0
+            if flen + blen < MIN_STEPS:
+                continue
+            parts = []
+            if bk is not None and len(bk) > 1:
+                parts.append(bk[::-1])
+            if f is not None and len(f) > 0:
+                parts.append(f)
+            if parts:
+                slice_streamlines.append(
+                    np.concatenate(parts, axis=0).astype(np.float32))
+            if len(slice_streamlines) >= TARGET_PER_Z:
+                break
+
+        pct = 100 * b1 / n_seeds
+        print(f"  batch {b+1}/{n_batches} ({pct:.0f}%)  "
+              f"sl: {len(slice_streamlines):,}", flush=True)
         del fwd, bwd
         gc.collect()
 
-    return streamlines
+    print(f"  → {len(slice_streamlines):,} streamlines for Z={z}")
+    all_streamlines.extend(slice_streamlines)
 
-# ==========================================================
-# RUN
-# ==========================================================
-print(f"\nTracking (target: {TARGET_SL} streamlines)...")
-print(f"  step_size = {step_size:.5f} mm")
-print(f"  max_angle = {MAX_ANGLE}°")
-print(f"  min_steps = {MIN_STEPS}")
+    del sl_data, tissue, valid_tissue, dirx, diry
+    del seed_mm, slice_streamlines
+    gc.collect()
 
-streamlines = collect_streamlines_targeted(seeds_mm, TARGET_SL)
-print(f"\nFinal streamline count: {len(streamlines):,}")
+print(f"\nTotal: {len(all_streamlines):,} streamlines")
 
 # ==========================================================
 # SAVE
 # ==========================================================
-if streamlines:
+if all_streamlines:
     print("Saving...")
-    sl_obj = Streamlines(streamlines)
-    sft = StatefulTractogram(sl_obj, nifti_img, Space.RASMM)
+    sl_obj = Streamlines(all_streamlines)
+    sft    = StatefulTractogram(sl_obj, nifti_img, Space.RASMM)
 
-    # Fallback — manual bbox filter
     sft.to_vox()
-    valid = []
-    for s in sft.streamlines:
-        if (s.min() >= 0 and s[:,0].max() < shape[0] and
-                s[:,1].max() < shape[1] and s[:,2].max() < shape[2]):
-            valid.append(s)
-    print(f"Valid after filter: {len(valid):,} / {len(streamlines):,}")
-    sft_clean = StatefulTractogram(Streamlines(valid), nifti_img, Space.VOX)
+    valid = [s for s in sft.streamlines
+             if s.min() >= 0
+             and s[:, 0].max() < shape[0]
+             and s[:, 1].max() < shape[1]
+             and s[:, 2].max() < shape[2]]
+    print(f"Valid : {len(valid):,} / {len(all_streamlines):,}")
 
+    sft_clean = StatefulTractogram(Streamlines(valid),
+                                   nifti_img, Space.VOX)
     save_trk(sft_clean, output_trk, bbox_valid_check=False)
     print(f"Saved → {output_trk}")
 
     lengths = np.array([len(s) for s in sft_clean.streamlines])
     print(f"Count  : {len(sft_clean):,}")
-    print(f"Length : min={lengths.min()} max={lengths.max()} "
-          f"mean={lengths.mean():.1f} steps "
+    print(f"Length : min={lengths.min()}  max={lengths.max()}  "
+          f"mean={lengths.mean():.1f} steps  "
           f"({lengths.mean()*step_size:.2f} mm mean)")
     print(f"Size   : {os.path.getsize(output_trk)/1e9:.2f} GB")
+else:
+    print("No streamlines — check parameters")
