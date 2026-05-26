@@ -17,17 +17,20 @@ These are the files that need to be executed:
 3. The microscopy data is given as a individual slices which has to be stacked and registered each other. This is done using the script 
 **register_pli_stack.py** (output a nii.gz file)
 
-4. Further register the self registered stack microscopy to the original MRI volume with **PLI_MRI_Registration.py
- To be tested** (output a nii.gz file)
+4. Compute the microscopy tractography with the cleaned self-registered and registered microscopy data with the script
+   **run_microscopy_tractography.py** (output a trk file), if you use a PLI use  **run_PLI_tractography.py** because PLI tractography is based on coherence of  
+   Polarized light imaging rather than structure tenso
 
-5. Compute the microscopy tractography with the cleaned self-registered and registered microscopy data with the script
-   **run_microscopy_tractography.py** (output a trk file)
- 
-# LSTM/VAE translation
+5. In case the tractography is squeezing the z-axis, rescale it with **rescale_microscopy_trk.py**
 
-7. Train and use an LSTM/VAE Given the MRI trk file as 1D points generate the microscopy trk file.
+# VAE translation
+
+6. Train and use an  VAE going back and forth one latent space to the other.
 
 ![pipeline](pipeline.png)
 
 
 ![im1](im1.png)
+
+
+4b. Further register the self registered stack microscopy to the original MRI volume with **PLI_MRI_Registration.py**  This has some bugs in case of very large microscopy images.
