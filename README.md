@@ -18,8 +18,7 @@ These are the files that need to be executed:
 **register_pli_stack.py** (output a nii.gz file)
 
 4. Compute the microscopy tractography with the cleaned self-registered and registered microscopy data with the script
-   **run_microscopy_tractography.py** (output a trk file), if you use a PLI use  **run_PLI_tractography.py** because PLI tractography is based on coherence of  
-   Polarized light imaging rather than structure tenso
+   **run_microscopy_tractography.py** (output a trk file), if you use a PLI use  **run_PLI_tractography.py** because PLI tractography is based on coherence of Polarized light imaging rather than structure tensor
 
 5. In case the tractography is squeezing the z-axis, rescale it with **rescale_microscopy_trk.py**
 
