@@ -86,9 +86,9 @@ class TrainConfig:
     chunk: int = 2                # bundles per gradient-accumulation micro-step
     epochs: int = 200
     lr: float = 2e-4
-    kl_warmup_steps: int = 2000
+    kl_warmup_steps: int = 370
     kl_weight: float = 0.1
-    free_bits: float = 0.05      # min nats/dim kept alive -- guards against posterior collapse
+    free_bits: float = 0.5 # 0.05      # min nats/dim kept alive -- guards against posterior collapse
     cycle_weight: float = 1.0
     smooth_weight: float = 0.0   # weight on curvature_loss; try 0.01-0.1 if output looks scribbly
     patience: int = 0            # epochs without improvement before early stopping; 0 disables
