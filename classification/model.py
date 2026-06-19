@@ -8,16 +8,27 @@ comfortably on an 8 GB GPU):
     points (P,3) --PointEncoder (self-attn over the P points)--> per-streamline embedding (D)
     streamlines (K,D) --BundleEncoder (self-attn over the K streamlines)--> mu, logvar (latent_dim)
     z (latent_dim) --BundleDecoder (broadcast z, self-attn over K learned slots)--> per-streamline embedding (D)
-    embedding (D) --PointDecoder (P learned positional queries cross-attend to it)--> points (P,3)
+    embedding (D) --PointDecoder (sinusoidal arc-length queries cross-attend to it)--> points (P,3)
 
 Each modality (MRI, PLI/microscopy) gets its own encoder/decoder pair, but
 both encoders write into the *same* latent space. That shared space is what
 makes `cross_forward` (encode with one modality's encoder, decode with the
-other's decoder) a meaningful translation operator rather than just two
+other's decoder) a meaningful translation operator rather than two
 unrelated autoencoders.
+
+Change from original: PointDecoder now uses fixed sinusoidal arc-length
+embeddings at t = [0, 1/(P-1), ..., 1] as decoder queries instead of
+learned positional parameters. The original learned queries had no ordering
+signal, so the decoder had to discover point order from scratch -- which it
+reliably failed to do, producing zigzag / scribble output and reconstruction
+loss stuck above 1.9 on z-scored data (a "predict noise" baseline). The
+sinusoidal embeddings give the decoder a monotonic "where along the
+streamline am I" signal that makes smooth sequential output learnable from
+the first gradient step.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +44,31 @@ class ModelConfig:
     n_heads: int = 4
     n_layers: int = 2
     latent_dim: int = 48
+
+
+def _sinusoidal_arc_lengths(P: int, d_model: int, device: torch.device) -> torch.Tensor:
+    """Fixed sinusoidal embeddings at t = [0, 1/(P-1), ..., 1].
+
+    Returns (1, P, d_model). The monotonic t encodes "where along the
+    streamline am I", giving the decoder an ordering signal that makes
+    smooth sequential output far easier to learn than learned queries with
+    no positional structure.
+
+    Uses the standard sin/cos frequency encoding from "Attention Is All You
+    Need" but with t in [0,1] rather than integer positions, so it
+    generalises cleanly to different values of P at inference time.
+    """
+    t = torch.linspace(0, 1, P, device=device)               # (P,)
+    half = d_model // 2
+    freqs = torch.exp(
+        -math.log(10000.0) * torch.arange(half, device=device) / max(half - 1, 1)
+    )                                                          # (half,)
+    angles = t[:, None] * freqs[None, :]                      # (P, half)
+    pe = torch.cat([angles.sin(), angles.cos()], dim=-1)      # (P, d_model)
+    # If d_model is odd, the cat gives d_model-1 columns; pad one zero column.
+    if pe.shape[-1] < d_model:
+        pe = torch.cat([pe, torch.zeros(P, 1, device=device)], dim=-1)
+    return pe.unsqueeze(0)                                     # (1, P, d_model)
 
 
 def _encoder_stack(d_model: int, n_heads: int, n_layers: int) -> nn.TransformerEncoder:
@@ -99,17 +135,30 @@ class BundleDecoder(nn.Module):
         self.encoder = _encoder_stack(cfg.d_model, cfg.n_heads, cfg.n_layers)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        cond = self.z_proj(z).unsqueeze(1)                  # (B, 1, D)
+        cond = self.z_proj(z).unsqueeze(1)                   # (B, 1, D)
         slots = self.slots.expand(z.shape[0], -1, -1) + cond
-        return self.encoder(slots)                          # (B, K, D)
+        return self.encoder(slots)                           # (B, K, D)
 
 
 class PointDecoder(nn.Module):
-    """Per-streamline embedding (N, D) -> points (N, P, 3), N = B*K flattened."""
+    """Per-streamline embedding (N, D) -> points (N, P, 3), N = B*K flattened.
+
+    Queries are fixed sinusoidal arc-length embeddings, not learned parameters.
+    This is the key fix vs. the original: learned queries with no ordering
+    structure caused the decoder to produce zigzag / scribble streamlines
+    because nothing told it which query should come first along the path.
+    Sinusoidal embeddings at t in [0,1] provide that monotonic signal for free.
+    """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.queries = nn.Parameter(torch.randn(1, cfg.P, cfg.d_model) * 0.02)
+        self.P = cfg.P
+        self.d_model = cfg.d_model
+        # Project the per-streamline embedding into decoder memory space.
+        # The original used the embedding directly as a (N,1,D) memory vector;
+        # adding an explicit projection gives the decoder a learned interface
+        # between the encoder's representation and the positional query space.
+        self.mem_proj = nn.Linear(cfg.d_model, cfg.d_model)
         layer = nn.TransformerDecoderLayer(
             cfg.d_model, cfg.n_heads, dim_feedforward=4 * cfg.d_model,
             batch_first=True, norm_first=True,
@@ -118,10 +167,14 @@ class PointDecoder(nn.Module):
         self.out = nn.Linear(cfg.d_model, 3)
 
     def forward(self, emb: torch.Tensor) -> torch.Tensor:
-        memory = emb.unsqueeze(1)                            # (N, 1, D)
-        q = self.queries.expand(emb.shape[0], -1, -1)
-        h = self.decoder(q, memory)
-        return self.out(h)
+        # emb: (N, D)  where N = B*K
+        memory = self.mem_proj(emb).unsqueeze(1)             # (N, 1, D)
+        # Arc-length queries are computed fresh each forward pass so they live
+        # on whatever device emb is on, with no stored parameter overhead.
+        q = _sinusoidal_arc_lengths(self.P, self.d_model, emb.device)
+        q = q.expand(emb.shape[0], -1, -1)                  # (N, P, D)
+        h = self.decoder(q, memory)                          # (N, P, D)
+        return self.out(h)                                   # (N, P, 3)
 
 
 class ModalityEncoder(nn.Module):
