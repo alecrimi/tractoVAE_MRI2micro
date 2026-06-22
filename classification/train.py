@@ -76,8 +76,8 @@ from model import CrossModalStreamlineVAE, ModelConfig
 
 @dataclass
 class TrainConfig:
-    K: int = 32                  # streamlines per bundle
-    P: int = 128                 # resampled points per streamline
+    K: int = 8                   # was 32 -- smaller bundles are more spatially coherent after spatial sort
+    P: int = 32                  # was 128 -- PLI streamlines ~20mm; 128pts=0.16mm/step, noise-dominated
     d_model: int = 96
     n_heads: int = 4
     n_layers: int = 2
@@ -86,9 +86,9 @@ class TrainConfig:
     chunk: int = 2                # bundles per gradient-accumulation micro-step
     epochs: int = 200
     lr: float = 2e-4
-    kl_warmup_steps: int = 370
+    kl_warmup_steps: int = 400   # ~10 epochs for a ~40 steps/epoch dataset; was 2000 (=54 epochs)
     kl_weight: float = 0.1
-    free_bits: float = 0.5 # 0.05      # min nats/dim kept alive -- guards against posterior collapse
+    free_bits: float = 0.05      # min nats/dim kept alive -- guards against posterior collapse
     cycle_weight: float = 1.0
     smooth_weight: float = 0.0   # weight on curvature_loss; try 0.01-0.1 if output looks scribbly
     patience: int = 0            # epochs without improvement before early stopping; 0 disables
@@ -135,8 +135,8 @@ def main() -> None:
     p.add_argument("--mri", required=True, help="MRI tractography .trk, e.g. dti_MRI_streamlines_Sample1.trk")
     p.add_argument("--pli", required=True, help="microscopy tractography .trk, e.g. microscopy_tractography_zscaled.trk")
     p.add_argument("--out", default="runs/exp1")
-    p.add_argument("--K", type=int, default=32)
-    p.add_argument("--P", type=int, default=128)
+    p.add_argument("--K", type=int, default=8)
+    p.add_argument("--P", type=int, default=32)
     p.add_argument("--d-model", type=int, default=96)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--n-layers", type=int, default=2)
