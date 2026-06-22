@@ -27,6 +27,7 @@ These are the files that need to be executed:
 6. Train and use an  VAE going back and forth one latent space to the other.
 
 To train the VAE:
+
 python train.py \
   --mri dti_MRI_streamlines_Sample1.trk \
   --pli microscopy_tractography_zscaled.trk \
@@ -38,6 +39,7 @@ python train.py \
   --device cuda
 
 To generate a file given model and input:
+
 python generate.py \
   --checkpoint runs/exp5/best.pt --stats-dir runs/exp5 \
   --mri dti_MRI_streamlines_Sample1.trk \
