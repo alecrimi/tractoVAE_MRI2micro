@@ -5,8 +5,10 @@ tractography can contain more relevant details as it is based on real cell imagi
 
 These are the files that need to be executed:
 
+0. Potentially fix the affine orientation in both the MRI and microscopy
+   e.g.  **python3 build_true_affine.py registered_stack_fixed_trueorient.nii.gz     registered_stack_fixed_final.nii.gz ILP --spacing None,None,100**
+   and **python3 build_true_affine.py b0_fixed.nii.gz b0_fixed_trueorient.nii.gz LSP**
 ## MRI
-0. Files shuold have eddy-current interference removed e.g. with FSL
 
 1. The file to generate the tractography MRI is **generate_streamlines_MRI.py** (output a trk file)
 
